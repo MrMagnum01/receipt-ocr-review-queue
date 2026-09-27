@@ -22,6 +22,18 @@ def field_reasons(field_name: str, field: FieldExtraction) -> list[str]:
     return reasons
 
 
+def item_confidence_reasons(items: list[LineItem]) -> list[str]:
+    """Per-item confidence check. The receipt-level mean item confidence is
+    not checked anywhere else in classify() -- a single very-low-confidence
+    item line must not be averaged away by several high-confidence ones, so
+    every item is tested against the same threshold individually."""
+    reasons = []
+    for item in items:
+        if item.confidence < CONFIDENCE_THRESHOLD:
+            reasons.append(f"low_confidence_item:{item.name}:{item.confidence:.2f}")
+    return reasons
+
+
 def reconciliation_reasons(
     total: FieldExtraction, items: list[LineItem], unparsed_item_reasons: list[str]
 ) -> list[str]:
@@ -50,5 +62,6 @@ def classify(
     reasons += field_reasons("date", date)
     reasons += field_reasons("total", total)
     reasons += field_reasons("currency", currency)
+    reasons += item_confidence_reasons(items)
     reasons += reconciliation_reasons(total, items, unparsed_item_reasons)
     return reasons

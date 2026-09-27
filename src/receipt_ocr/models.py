@@ -10,6 +10,11 @@ class LineItem:
     name: str
     qty: int
     unit_price: float
+    # OCR confidence for the item line this was parsed from, 0.0-1.0.
+    # Ground-truth items (generator.py) have nothing to be confident
+    # about and keep the default of full confidence; extracted items
+    # (extract.py) always set this from the real OCR line confidence.
+    confidence: float = 1.0
 
     @property
     def amount(self) -> float:

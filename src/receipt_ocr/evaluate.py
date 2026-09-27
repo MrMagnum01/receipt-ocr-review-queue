@@ -4,12 +4,18 @@ asserted, never presented as a real-world accuracy claim.
 
 Validates the CSV headers it reads before trusting a single row: a header
 that doesn't match the declared schema contract is a hard failure, not a
-best-effort parse.
+best-effort parse. It also re-validates the *shape* of a completed run
+before scoring it at all: duplicate receipt ids, an id in both CSVs, an id
+missing from both, an unrecognised manifest outcome, summary counts that
+don't reconcile, or accepted/review CSV content that no longer matches the
+sha256 the manifest recorded for it (see pipeline.py's atomic_publish_set)
+are all hard failures -- never silently averaged into an accuracy number.
 """
 
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 
@@ -17,6 +23,7 @@ from .atomic import atomic_write_text
 from .schema import ACCEPTED_HEADER, REVIEW_HEADER, validate_header
 
 FIELDS = ("shop", "date", "total", "currency", "items")
+PERMITTED_OUTCOMES = {"accepted", "review", "error"}
 
 
 def _unescape(value: str) -> str:
@@ -26,16 +33,21 @@ def _unescape(value: str) -> str:
     return value
 
 
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _load_csv(path: Path, expected_header: tuple[str, ...]) -> dict[str, dict[str, str]]:
     rows: dict[str, dict[str, str]] = {}
-    if not path.exists():
-        return rows
     with path.open("r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         validate_header(reader.fieldnames, expected_header, source=str(path))
         for raw in reader:
             row = {k: _unescape(v) for k, v in raw.items()}
-            rows[row["receipt_id"]] = row
+            rid = row["receipt_id"]
+            if rid in rows:
+                raise ValueError(f"{path}: duplicate receipt_id {rid!r} -- refusing to score an ambiguous file")
+            rows[rid] = row
     return rows
 
 
@@ -46,19 +58,72 @@ def _load_ground_truth(path: Path) -> dict[str, dict]:
 
 def evaluate(out_dir: str | Path, ground_truth_path: str | Path) -> dict:
     out_dir = Path(out_dir)
-    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
-    accepted = _load_csv(out_dir / "accepted.csv", ACCEPTED_HEADER)
-    review = _load_csv(out_dir / "review_queue.csv", REVIEW_HEADER)
+    manifest_path = out_dir / "manifest.json"
+    accepted_path = out_dir / "accepted.csv"
+    review_path = out_dir / "review_queue.csv"
+    for p in (manifest_path, accepted_path, review_path):
+        if not p.exists():
+            raise ValueError(f"cannot evaluate: required output file is missing: {p}")
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    accepted = _load_csv(accepted_path, ACCEPTED_HEADER)
+    review = _load_csv(review_path, REVIEW_HEADER)
     gt = _load_ground_truth(Path(ground_truth_path))
 
+    # Bind to the publish: a manifest whose recorded hash of either CSV no
+    # longer matches what's on disk means this is not the coherent output
+    # of one run (e.g. a crash landed between atomic_publish_set's
+    # renames, or a file was hand-edited/replaced afterwards). Refuse to
+    # score it rather than silently reporting on a mismatched set.
+    recorded_hashes = manifest.get("content_sha256") or {}
+    actual_hashes = {"accepted.csv": _sha256_file(accepted_path), "review_queue.csv": _sha256_file(review_path)}
+    mismatched = [name for name, h in recorded_hashes.items() if actual_hashes.get(name) != h]
+    if mismatched:
+        raise ValueError(
+            f"manifest.json content_sha256 does not match the file(s) on disk: {mismatched} -- "
+            "this output directory is not the coherent result of one publish"
+        )
+
     receipts = manifest["receipts"]
-    if set(r["receipt_id"] for r in receipts) != set(gt.keys()):
+    manifest_ids = [r["receipt_id"] for r in receipts]
+    if len(manifest_ids) != len(set(manifest_ids)):
+        dupes = sorted({rid for rid in manifest_ids if manifest_ids.count(rid) > 1})
+        raise ValueError(f"manifest.json has duplicate receipt_id(s): {dupes}")
+    manifest_id_set = set(manifest_ids)
+
+    if manifest_id_set != set(gt.keys()):
         raise ValueError("manifest and ground truth cover a different set of receipts")
+
+    bad_outcomes = {r["outcome"] for r in receipts} - PERMITTED_OUTCOMES
+    if bad_outcomes:
+        raise ValueError(f"manifest.json has unrecognised outcome(s): {sorted(bad_outcomes)}")
+
+    accepted_ids = set(accepted.keys())
+    review_ids = set(review.keys())
+    if accepted_ids & review_ids:
+        raise ValueError(
+            f"receipt id(s) present in both accepted.csv and review_queue.csv: {sorted(accepted_ids & review_ids)}"
+        )
+
+    expected_accepted_ids = {r["receipt_id"] for r in receipts if r["outcome"] == "accepted"}
+    expected_review_ids = {r["receipt_id"] for r in receipts if r["outcome"] in ("review", "error")}
+    if accepted_ids != expected_accepted_ids:
+        raise ValueError("accepted.csv rows do not exactly match the manifest's 'accepted' outcomes")
+    if review_ids != expected_review_ids:
+        raise ValueError("review_queue.csv rows do not exactly match the manifest's 'review'/'error' outcomes")
+
+    summary = manifest["summary"]
+    if summary["accepted"] + summary["review"] + summary.get("error", 0) != summary["total_images"]:
+        raise ValueError("manifest summary counts do not reconcile to total_images")
+    if summary["accepted"] != len(expected_accepted_ids):
+        raise ValueError("manifest summary 'accepted' count does not match the manifest's own receipt rows")
+    if summary["review"] + summary.get("error", 0) != len(expected_review_ids):
+        raise ValueError("manifest summary 'review'+'error' count does not match the manifest's own receipt rows")
 
     field_correct = {f: 0 for f in FIELDS}
     field_total = {f: 0 for f in FIELDS}
     accepted_total = 0
-    accepted_fully_correct = 0
+    accepted_fields_agree = 0
 
     for entry in receipts:
         rid = entry["receipt_id"]
@@ -90,7 +155,7 @@ def evaluate(out_dir: str | Path, ground_truth_path: str | Path) -> dict:
         if entry["outcome"] == "accepted":
             accepted_total += 1
             if all(checks.values()):
-                accepted_fully_correct += 1
+                accepted_fields_agree += 1
 
     n = len(receipts)
     report = {
@@ -101,7 +166,15 @@ def evaluate(out_dir: str | Path, ground_truth_path: str | Path) -> dict:
         "per_field_accuracy": {
             f: round(field_correct[f] / field_total[f], 4) if field_total[f] else None for f in FIELDS
         },
-        "auto_accept_precision": round(accepted_fully_correct / accepted_total, 4) if accepted_total else None,
+        # Of the auto-accepted receipts, the fraction that agree with ground
+        # truth on every field this evaluator actually checks: shop, date,
+        # total, currency, and items (sum-of-line-items + item count only --
+        # NOT item names, quantities or unit prices, which this evaluator
+        # does not compare). This is agreement on the scored fields, not a
+        # claim that the receipt was reproduced completely correctly.
+        "auto_accept_scored_field_agreement": (
+            round(accepted_fields_agree / accepted_total, 4) if accepted_total else None
+        ),
     }
     atomic_write_text(out_dir / "evaluation_report.json", json.dumps(report, indent=2, sort_keys=True))
     return report

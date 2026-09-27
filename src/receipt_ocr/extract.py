@@ -92,19 +92,18 @@ def extract_total_and_currency(lines: list[OcrLine]) -> tuple[FieldExtraction, F
         if code:
             found_codes.setdefault(code, []).append(conf)
 
-    # total amount: the rightmost token on the TOTAL line that matches the
-    # declared money grammar, allowing exactly one glued currency marker.
-    amount = None
-    amount_conf = 0
-    glued_code = None
-    for word, conf in reversed(total_line.words):
+    # total amount candidates: every token on the TOTAL line that matches
+    # the declared money grammar, each allowing exactly one glued currency
+    # marker. All candidates are inspected -- not just the rightmost one --
+    # so a second, conflicting amount/currency token elsewhere on the line
+    # can't be silently ignored.
+    candidates: list[tuple[float, int, str | None]] = []  # (value, conf, glued_code)
+    for word, conf in total_line.words:
         value, code = parse_money_with_symbol(word)
         if value is not None:
-            amount, amount_conf, glued_code = value, conf, code
-            break
-
-    if glued_code:
-        found_codes.setdefault(glued_code, []).append(amount_conf)
+            candidates.append((value, conf, code))
+            if code:
+                found_codes.setdefault(code, []).append(conf)
 
     if len(found_codes) == 0:
         currency = FieldExtraction(value=None, confidence=0.0, ok=False, reason="currency_not_found")
@@ -116,10 +115,25 @@ def extract_total_and_currency(lines: list[OcrLine]) -> tuple[FieldExtraction, F
         (code, confs), = found_codes.items()
         currency = FieldExtraction(value=code, confidence=round((sum(confs) / len(confs)) / 100.0, 3), ok=True)
 
-    if amount is None:
+    if not candidates:
         total = FieldExtraction(value=None, confidence=0.0, ok=False, reason="invalid_total_amount")
     else:
-        total = FieldExtraction(value=f"{amount:.2f}", confidence=round(amount_conf / 100.0, 3), ok=True)
+        # Two candidates count as the "same" total only if they agree on
+        # both amount *and* currency -- "$10.00" and "EUR10.00" are not the
+        # same total just because they happen to share a numeric value.
+        distinct_candidates = {(round(v, 2), code) for v, _conf, code in candidates}
+        if len(distinct_candidates) > 1:
+            # Two or more amount/currency candidates on the declared total
+            # line that don't agree -- e.g. "TOTAL $10.00 EUR10.00" or
+            # "TOTAL $10.00 $12.00". Ambiguous; reject rather than
+            # silently picking one (the rightmost token, as before).
+            listing = "+".join(
+                f"{code or 'unmarked'}{v:.2f}" for v, _conf, code in candidates
+            )
+            total = FieldExtraction(value=None, confidence=0.0, ok=False, reason=f"ambiguous_total:{listing}")
+        else:
+            amount, amount_conf, _code = candidates[-1]
+            total = FieldExtraction(value=f"{amount:.2f}", confidence=round(amount_conf / 100.0, 3), ok=True)
 
     return total, currency
 
@@ -144,7 +158,14 @@ def extract_items(lines: list[OcrLine]) -> tuple[list[LineItem], list[str], floa
             unparsed.append(f"unparsed_item_line:{snippet}")
             continue
         unit_price = round(amount / qty, 2)
-        items.append(LineItem(name=m.group("name").strip(), qty=qty, unit_price=unit_price))
+        items.append(
+            LineItem(
+                name=m.group("name").strip(),
+                qty=qty,
+                unit_price=unit_price,
+                confidence=round(line.mean_conf / 100.0, 3),
+            )
+        )
         confs.append(line.mean_conf)
 
     mean_conf = (sum(confs) / len(confs) / 100.0) if confs else 0.0

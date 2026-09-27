@@ -35,25 +35,45 @@ gets flagged rather than silently wrong.
    warp plus noise plus a randomly cropped bottom edge, simulating a
    partially-visible scan).
 2. `run` — for every image in a directory: deterministic preprocessing
-   (grayscale, autocontrast, upscale, sharpen), Tesseract OCR with
-   per-word confidences, then field extraction against a **declared
-   grammar** (see "How extraction works"). Writes `accepted.csv` and
-   `review_queue.csv`, plus a `manifest.json` that lists every input
-   image and which of the two CSVs it landed in. All three files are
-   published atomically (written to a temp file, then renamed into
-   place), so a reader never sees a half-written file.
+   (grayscale, autocontrast, upscale, sharpen), Tesseract OCR (bounded by
+   a 30s per-image timeout) with per-word confidences, then field
+   extraction against a **declared grammar** (see "How extraction
+   works"). Writes `accepted.csv` and `review_queue.csv`, plus a
+   `manifest.json` that lists every input image and which outcome it got.
+   Each of the three files is written atomically on its own (temp file,
+   then rename), and all three are additionally *prepared* (written and
+   fsynced to temp names) before any of them is renamed into place, so a
+   write failure partway through never leaves one new file next to two
+   old ones. That narrows, but doesn't eliminate, the exposure: a crash
+   during the handful of renames itself is still possible in principle,
+   which is why the manifest also records a sha256 of each CSV's content
+   — `evaluate` refuses to score the set if either file's hash doesn't
+   match what the manifest published (`atomic.py: atomic_publish_set`).
 3. `evaluate` — compares `accepted.csv` + `review_queue.csv` against
    `ground_truth.json` and writes `evaluation_report.json`: per-field
-   accuracy, the review-queue rate, and the precision of auto-accepted
-   receipts (of the receipts the pipeline accepted without review, what
-   fraction were completely correct). It validates both CSVs' headers
-   against the declared schema before trusting a single row.
+   accuracy, the review-queue rate, and the auto-accepted receipts' rate
+   of agreement with ground truth on every field this evaluator actually
+   checks (see "Measured accuracy" for exactly which). It validates both
+   CSVs' headers against the declared schema, refuses duplicate receipt
+   ids inside a CSV or across the manifest, refuses an id that's in both
+   CSVs or in neither, and refuses a manifest whose summary counts don't
+   add up — before trusting a single row.
 
 Row accounting always reconciles: every image discovered under the input
-directory produces exactly one row in exactly one output CSV — a file
-that fails to OCR at all still gets a `review_queue.csv` row with a
-`processing_error` reason, never a silent skip. `tests/test_failures.py`
-and `tests/test_pipeline_reconciliation.py` check this directly.
+directory produces exactly one row in exactly one output CSV, and every
+receipt lands in exactly one of three manifest outcomes — `accepted`,
+`review` (a business-rule/confidence check failed), or `error` (the image
+itself couldn't be opened or OCR'd: corrupt file, decode failure, a
+declared Tesseract engine error, or a Tesseract timeout). An `error`
+receipt still gets a `review_queue.csv` row with a categorised
+`processing_error:<ExceptionType>` reason — never a silent skip and never
+a crash that aborts the rest of the batch. `accepted + review + error ==
+total_images` is asserted in `pipeline.py` and checked again independently
+by `evaluate.py`. Two input files that would collide on the same receipt
+id (e.g. `r1.png` and `r1.jpg`, since the id is the filename stem) are
+refused before anything is published, rather than one silently
+overwriting the other. `tests/test_failures.py` and
+`tests/test_pipeline_reconciliation.py` check this directly.
 
 ## Setup
 
@@ -90,11 +110,13 @@ python3 -m receipt_ocr evaluate --out data/output --ground-truth data/ground_tru
 PYTHONPATH=src python3 -m pytest tests/ -q
 ```
 
-55 tests: image-level generator determinism, the money/date/CSV-safety
+61 tests: image-level generator determinism, the money/date/CSV-safety
 grammar, field extraction against constructed OCR lines (including
-malformed-line and conflicting-currency cases), full-pipeline
-reconciliation against a real generated+OCR'd corpus, and failure classes
-(corrupt file, empty input directory, formula-injection payloads).
+malformed-line, conflicting-currency, ambiguous-total and low-confidence-
+item cases), full-pipeline reconciliation against a real generated+OCR'd
+corpus, and failure classes (corrupt file, simulated Tesseract engine
+error and timeout, duplicate receipt ids, empty input directory,
+formula-injection payloads).
 
 ## Measured accuracy — on this synthetic set only
 
@@ -116,15 +138,27 @@ each, in rotation):
 | Per-field accuracy — total | 76.7% |
 | Per-field accuracy — currency | 83.3% |
 | Per-field accuracy — items (sum + count) | 61.7% |
-| Precision of auto-accepted receipts | 100% (35 / 35) |
+| Auto-accepted receipts' scored-field agreement | 100% (35 / 35) |
 
 Per-field accuracy is measured across **all** 60 receipts, whether they
 were auto-accepted or sent to review — it's a measure of raw extraction
-quality, not of what got published. "Precision of auto-accepted receipts"
-is the number that matters for the review-queue design: of the receipts
-the pipeline was confident enough to auto-accept, all 35 were completely
-correct on this run. This is a small synthetic sample at one seed; it is
-not a statistical guarantee, and it is not a claim about real scanned
+quality, not of what got published. "Auto-accepted receipts' scored-field
+agreement" is the number that matters for the review-queue design: of the
+receipts the pipeline was confident enough to auto-accept, all 35 agreed
+with ground truth on every field `evaluate.py` actually checks — shop,
+date, total, currency, and items (the **sum of item amounts and the item
+count** only). It is **not** a claim that these 35 receipts were
+reproduced completely correctly: item names, quantities and unit prices
+are extracted (`extract.py: extract_items`) but not exported to the CSVs
+or compared by the evaluator, so a receipt whose true items are entirely
+different but happen to sum to the same total and count would still score
+as agreeing here. Extending the evaluator to compare actual item records
+would be needed to support a stronger claim; that extension is out of
+scope for this demo. Tesseract's own word/line confidence is a heuristic
+score from the engine, not a calibrated probability of correctness — the
+0.75 threshold in `confidence.py` is a fixed cutoff, not a tuned
+statistical bound. This is a small synthetic sample at one seed; it is not
+a statistical guarantee, and it is not a claim about real scanned
 receipts, which involve fonts, layouts and camera artefacts this
 generator doesn't produce. Run `evaluate` on your own generated seeds to
 see how the numbers move.
@@ -140,6 +174,16 @@ see how the numbers move.
   recognised marker; two conflicting markers on the same total line
   (`$10.00 EUR`) reject the currency field as `currency_conflict`, not a
   guess at which one is right (`schema.py: parse_money_with_symbol`).
+- **Ambiguous totals are rejected, not resolved by picking one token.**
+  `extract_total_and_currency` inspects *every* grammar-valid amount
+  candidate on the declared total line, not just the rightmost one. If
+  more than one distinct (amount, currency) candidate is found — two
+  different amounts (`TOTAL $10.00 $12.00`), or the same amount glued to
+  two different currency markers (`TOTAL $10.00 EUR10.00`, which is not
+  "the same total twice" just because the numbers match) — the `total`
+  field itself is rejected as `ambiguous_total:<candidates>` and sent to
+  review, on top of whatever `currency_conflict` also fires
+  (`extract.py`, `tests/test_extract.py`).
 - **Dates** are matched against 4 declared formats (ISO, `d/m/Y`, `d-m-Y`,
   `d Mon Y`); anything else is `invalid_date`, not guessed at
   (`schema.py: DATE_FORMATS`).
@@ -157,11 +201,18 @@ see how the numbers move.
   tax math). An item line whose amount doesn't match the money grammar is
   recorded as `unparsed_item_line:<snippet>`, not dropped from
   consideration.
-- **Confidence.** Each field's confidence comes from Tesseract's own
-  word-level confidence for the token(s) it was read from (shop is also
-  scaled by fuzzy-match ratio against the known shop names). A field
-  below 0.75 confidence, or that fails its rule check, adds a named reason
-  to the receipt; zero reasons means auto-accept (`confidence.py`).
+- **Confidence, checked per item, not just per field.** Each field's
+  confidence comes from Tesseract's own word-level confidence for the
+  token(s) it was read from (shop is also scaled by fuzzy-match ratio
+  against the known shop names). A field below 0.75 confidence, or that
+  fails its rule check, adds a named reason to the receipt. Item lines get
+  the same 0.75 gate individually — `item_confidence_reasons` in
+  `confidence.py` checks every parsed item's own OCR confidence, so one
+  low-confidence item line (e.g. one badly-OCR'd price in an otherwise
+  clean receipt) cannot be averaged away and auto-accepted just because
+  the shop/date/total/currency fields and the other items are confident.
+  Zero reasons across every field and every item means auto-accept
+  (`confidence.py`).
 - **Currency is kept per receipt, never converted.** Each receipt records
   whatever currency its own total line named; nothing sums or converts
   amounts across receipts of different currencies anywhere in this
@@ -212,14 +263,19 @@ src/receipt_ocr/
   models.py         LineItem / ReceiptGroundTruth / FieldExtraction / ExtractionResult
   schema.py         money/date grammar, currency markers, CSV header contracts,
                     formula-injection-safe CSV encoding
-  atomic.py         atomic (write-temp, then rename) file publishing
+  atomic.py         atomic (write-temp, then rename) file publishing, plus
+                    atomic_publish_set for the accepted/review/manifest triple
   generator.py       renders the deterministic synthetic corpus + ground truth
   preprocess.py      deterministic image preprocessing before OCR
-  ocr.py             pytesseract wrapper + position-based row reconstruction
-  extract.py         shop/date/total/currency/items extraction against the grammar
-  confidence.py       per-field threshold + rule-check classification (accept/review)
-  pipeline.py         orchestrates the above; atomic CSV/manifest publish
-  evaluate.py         scores pipeline output against ground truth
+  ocr.py             pytesseract wrapper (bounded by a timeout) + position-based
+                    row reconstruction
+  extract.py         shop/date/total/currency/items extraction against the grammar,
+                    including ambiguous-total detection
+  confidence.py       per-field and per-item threshold + rule-check classification
+  pipeline.py         orchestrates the above; duplicate-id refusal; categorises
+                    accepted/review/error outcomes; publishes the triple atomically
+  evaluate.py         scores pipeline output against ground truth; validates
+                    manifest/CSV consistency and content hashes before scoring
   cli.py             `generate` / `run` / `evaluate` subcommands
 tests/              pytest suite (generator determinism, grammar/CSV-safety,
                     extraction unit tests, pipeline reconciliation, failure classes)

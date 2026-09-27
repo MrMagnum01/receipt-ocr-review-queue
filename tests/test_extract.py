@@ -68,6 +68,42 @@ def test_extract_total_not_found():
     assert not currency.ok and currency.reason == "total_not_found"
 
 
+def test_extract_total_ambiguous_glued_currencies_rejected_not_picked():
+    # two glued currency markers with the same numeric amount: the old
+    # rightmost-token search picked the last one (EUR) and never noticed
+    # the $10.00 candidate to its left. Both currency and total must
+    # reject this as ambiguous rather than silently resolving it.
+    total, currency = extract_total_and_currency([line("TOTAL $10.00 EUR10.00")])
+    assert not total.ok
+    assert total.reason.startswith("ambiguous_total")
+    assert not currency.ok
+    assert currency.reason.startswith("currency_conflict")
+
+
+def test_extract_total_conflicting_amounts_same_currency_rejected():
+    # two candidate totals with no currency conflict at all -- the
+    # rightmost-token search would silently pick 12.00 and drop 10.00.
+    total, currency = extract_total_and_currency([line("TOTAL $10.00 $12.00")])
+    assert not total.ok
+    assert total.reason.startswith("ambiguous_total")
+
+
+def test_classify_flags_low_confidence_item_even_with_high_receipt_mean():
+    from receipt_ocr.models import FieldExtraction, LineItem
+
+    total = FieldExtraction(value="10.00", confidence=0.95, ok=True)
+    shop = FieldExtraction(value="Corner Grocery", confidence=0.95, ok=True)
+    date = FieldExtraction(value="2025-01-01", confidence=0.95, ok=True)
+    currency = FieldExtraction(value="USD", confidence=0.95, ok=True)
+    # one item at 1% confidence, everything else confident, total matches --
+    # the old code ignored item confidence entirely and auto-accepted this.
+    items = [
+        LineItem(name="Suspect Item", qty=1, unit_price=10.00, confidence=0.01),
+    ]
+    reasons = classify(shop, date, total, currency, items, [])
+    assert any(r.startswith("low_confidence_item:") for r in reasons)
+
+
 def test_extract_items_parses_name_qty_amount():
     items, unparsed, _conf = extract_items([line("Oat Milk 1L x2 4.98"), line("TOTAL USD $ 4.98")])
     assert len(items) == 1

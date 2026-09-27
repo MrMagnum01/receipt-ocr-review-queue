@@ -16,7 +16,7 @@ def test_every_input_lands_in_exactly_one_output(corpus, tmp_path):
     summary = process(corpus["dir"] / "images", out_dir)
 
     assert summary["total_images"] == len(corpus["records"])
-    assert summary["accepted"] + summary["review"] == summary["total_images"]
+    assert summary["accepted"] + summary["review"] + summary["error"] == summary["total_images"]
 
     accepted_ids = {r["receipt_id"] for r in _read_csv(out_dir / "accepted.csv")}
     review_ids = {r["receipt_id"] for r in _read_csv(out_dir / "review_queue.csv")}
@@ -44,8 +44,11 @@ def test_manifest_accounts_for_every_receipt(corpus, tmp_path):
     receipt_ids = {r["receipt_id"] for r in manifest["receipts"]}
     assert receipt_ids == {r.receipt_id for r in corpus["records"]}
     outcomes = {r["outcome"] for r in manifest["receipts"]}
-    assert outcomes <= {"accepted", "review"}
-    assert manifest["summary"]["accepted"] + manifest["summary"]["review"] == manifest["summary"]["total_images"]
+    assert outcomes <= {"accepted", "review", "error"}
+    assert (
+        manifest["summary"]["accepted"] + manifest["summary"]["review"] + manifest["summary"]["error"]
+        == manifest["summary"]["total_images"]
+    )
 
 
 def test_no_leftover_temp_files_after_publish(corpus, tmp_path):
@@ -64,18 +67,21 @@ def test_evaluate_runs_and_scores_are_in_range(corpus, tmp_path):
     assert 0.0 <= report["review_queue_rate"] <= 1.0
     for field, acc in report["per_field_accuracy"].items():
         assert acc is None or 0.0 <= acc <= 1.0
-    if report["auto_accept_precision"] is not None:
-        assert 0.0 <= report["auto_accept_precision"] <= 1.0
+    if report["auto_accept_scored_field_agreement"] is not None:
+        assert 0.0 <= report["auto_accept_scored_field_agreement"] <= 1.0
     assert (out_dir / "evaluation_report.json").exists()
 
 
-def test_auto_accepted_receipts_are_fully_correct_on_this_corpus(corpus, tmp_path):
+def test_auto_accepted_receipts_agree_on_scored_fields_on_this_corpus(corpus, tmp_path):
     # the headline claim this demo makes: whatever clears the confidence/
-    # rule bar and gets auto-accepted should, on this synthetic set, be
-    # completely correct. If this regresses, the threshold/rules need
-    # revisiting -- it should not be silently accepted as "good enough".
+    # rule bar and gets auto-accepted should, on this synthetic set, agree
+    # with ground truth on every field the evaluator actually checks (shop,
+    # date, total, currency, items sum+count -- not item names/quantities/
+    # prices, which aren't compared). If this regresses, the
+    # threshold/rules need revisiting -- it should not be silently accepted
+    # as "good enough".
     out_dir = tmp_path / "out"
     process(corpus["dir"] / "images", out_dir)
     report = evaluate(out_dir, corpus["dir"] / "ground_truth.json")
     if report["accepted_count"] > 0:
-        assert report["auto_accept_precision"] == 1.0
+        assert report["auto_accept_scored_field_agreement"] == 1.0

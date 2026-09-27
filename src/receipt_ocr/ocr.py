@@ -18,6 +18,14 @@ from dataclasses import dataclass, field
 import pytesseract
 from PIL import Image
 
+# Bounds how long a single image is allowed to spend inside the tesseract
+# subprocess. Without this, an image that makes the engine hang would hang
+# the whole batch forever -- a silent freeze, which is worse than a crash.
+# pytesseract enforces this itself and raises RuntimeError('Tesseract
+# process timeout') if it's exceeded; pipeline.py turns that into a
+# per-image categorised error rather than letting it escape.
+OCR_TIMEOUT_SECONDS = 30
+
 
 @dataclass
 class OcrLine:
@@ -38,7 +46,9 @@ class OcrResult:
 
 
 def run_ocr(img: Image.Image) -> OcrResult:
-    data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    data = pytesseract.image_to_data(
+        img, output_type=pytesseract.Output.DICT, timeout=OCR_TIMEOUT_SECONDS
+    )
 
     words = []  # (top, bottom, left, text, conf)
     all_confs: list[int] = []

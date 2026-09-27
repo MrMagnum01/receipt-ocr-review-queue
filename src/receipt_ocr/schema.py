@@ -121,7 +121,7 @@ REVIEW_HEADER: tuple[str, ...] = ACCEPTED_HEADER + ("reasons",)
 MANIFEST_HEADER: tuple[str, ...] = (
     "receipt_id",
     "image_path",
-    "outcome",  # "accepted" or "review"
+    "outcome",  # "accepted", "review", or "error" (processing/OCR failure)
 )
 
 
