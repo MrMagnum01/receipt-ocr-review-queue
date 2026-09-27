@@ -219,10 +219,12 @@ see how the numbers move.
   pipeline or its evaluation report. This is a single-receipt-at-a-time
   extraction tool, not an FX or multi-currency reconciliation tool.
 - **Formula-injection-safe CSV.** Any field whose value starts with
-  `= + - @` (or a stray tab/CR) is written with a leading `'`, which
-  forces Excel/Sheets/LibreOffice to treat it as text instead of opening
-  it as a formula (`schema.py: csv_safe`, exercised in
-  `tests/test_failures.py`).
+  `= + - @` (or a stray tab/CR) is written with a leading `'` — the
+  standard CSV convention for disarming formula auto-execution
+  (`schema.py: csv_safe`). Tested as a string transform on the written
+  cell (`tests/test_failures.py`); no spreadsheet application is opened
+  as part of that test, so this is not a verified claim about how any
+  specific program renders the result.
 
 ## Limits
 
@@ -273,7 +275,9 @@ src/receipt_ocr/
                     including ambiguous-total detection
   confidence.py       per-field and per-item threshold + rule-check classification
   pipeline.py         orchestrates the above; duplicate-id refusal; categorises
-                    accepted/review/error outcomes; publishes the triple atomically
+                    accepted/review/error outcomes; publishes the triple via
+                    atomic_publish_set (prepare-then-commit, hash-bound at read
+                    time -- not a single atomic transaction)
   evaluate.py         scores pipeline output against ground truth; validates
                     manifest/CSV consistency and content hashes before scoring
   cli.py             `generate` / `run` / `evaluate` subcommands
@@ -293,9 +297,6 @@ generator, pipeline, tests and README; an independent AI reviewer (a
 separate Codex-based agent) is expected to run adversarial probes against
 the built code and hold the repository until findings are fixed or a
 claim is narrowed to match what the code actually does, the same process
-used for this portfolio's other demos. The repository owner directed and
-approved the pipeline that produced this code, but did not personally
-author or line-by-line review the implementation — that distinction is
-what this section is stating, not a claim of hands-on authorship. All
-data is synthetic; no client or employer code, data, or receipt layout
-was used anywhere in this repository.
+used for this portfolio's other demos. All data is synthetic; no client
+or employer code, data, or receipt layout was used anywhere in this
+repository.

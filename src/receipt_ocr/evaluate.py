@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import re
 from pathlib import Path
 
 from .atomic import atomic_write_text
@@ -24,6 +25,8 @@ from .schema import ACCEPTED_HEADER, REVIEW_HEADER, validate_header
 
 FIELDS = ("shop", "date", "total", "currency", "items")
 PERMITTED_OUTCOMES = {"accepted", "review", "error"}
+REQUIRED_HASH_NAMES = ("accepted.csv", "review_queue.csv")
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _unescape(value: str) -> str:
@@ -53,7 +56,49 @@ def _load_csv(path: Path, expected_header: tuple[str, ...]) -> dict[str, dict[st
 
 def _load_ground_truth(path: Path) -> dict[str, dict]:
     records = json.loads(path.read_text(encoding="utf-8"))
-    return {r["receipt_id"]: r for r in records}
+    gt: dict[str, dict] = {}
+    for r in records:
+        rid = r["receipt_id"]
+        if rid in gt:
+            raise ValueError(
+                f"{path}: duplicate ground-truth receipt_id {rid!r} -- refusing to score against "
+                "an ambiguous ground truth (a dict comprehension would silently keep only the last one)"
+            )
+        gt[rid] = r
+    return gt
+
+
+def _validate_content_hashes(manifest: dict, accepted_path: Path, review_path: Path) -> None:
+    # Bind to the publish: a manifest whose recorded hash of either CSV no
+    # longer matches what's on disk means this is not the coherent output
+    # of one run (e.g. a crash landed between atomic_publish_set's
+    # renames, or a file was hand-edited/replaced afterwards). Both named
+    # hashes are mandatory -- a missing map, a missing/null entry, or a
+    # malformed (non-hex, wrong-length) value is refused exactly like a
+    # mismatch, never silently treated as "nothing to check".
+    recorded_hashes = manifest.get("content_sha256")
+    if not isinstance(recorded_hashes, dict):
+        raise ValueError(
+            "manifest.json is missing a content_sha256 mapping -- refusing to score an output "
+            "that cannot be bound to a specific publish"
+        )
+    malformed = [
+        name
+        for name in REQUIRED_HASH_NAMES
+        if not isinstance(recorded_hashes.get(name), str) or not _SHA256_HEX.match(recorded_hashes[name])
+    ]
+    if malformed:
+        raise ValueError(
+            f"manifest.json content_sha256 is missing or malformed for: {malformed} -- "
+            "both accepted.csv and review_queue.csv hashes are required to score this output"
+        )
+    actual_hashes = {"accepted.csv": _sha256_file(accepted_path), "review_queue.csv": _sha256_file(review_path)}
+    mismatched = [name for name in REQUIRED_HASH_NAMES if actual_hashes[name] != recorded_hashes[name]]
+    if mismatched:
+        raise ValueError(
+            f"manifest.json content_sha256 does not match the file(s) on disk: {mismatched} -- "
+            "this output directory is not the coherent result of one publish"
+        )
 
 
 def evaluate(out_dir: str | Path, ground_truth_path: str | Path) -> dict:
@@ -70,19 +115,7 @@ def evaluate(out_dir: str | Path, ground_truth_path: str | Path) -> dict:
     review = _load_csv(review_path, REVIEW_HEADER)
     gt = _load_ground_truth(Path(ground_truth_path))
 
-    # Bind to the publish: a manifest whose recorded hash of either CSV no
-    # longer matches what's on disk means this is not the coherent output
-    # of one run (e.g. a crash landed between atomic_publish_set's
-    # renames, or a file was hand-edited/replaced afterwards). Refuse to
-    # score it rather than silently reporting on a mismatched set.
-    recorded_hashes = manifest.get("content_sha256") or {}
-    actual_hashes = {"accepted.csv": _sha256_file(accepted_path), "review_queue.csv": _sha256_file(review_path)}
-    mismatched = [name for name, h in recorded_hashes.items() if actual_hashes.get(name) != h]
-    if mismatched:
-        raise ValueError(
-            f"manifest.json content_sha256 does not match the file(s) on disk: {mismatched} -- "
-            "this output directory is not the coherent result of one publish"
-        )
+    _validate_content_hashes(manifest, accepted_path, review_path)
 
     receipts = manifest["receipts"]
     manifest_ids = [r["receipt_id"] for r in receipts]

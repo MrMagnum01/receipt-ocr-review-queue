@@ -88,6 +88,29 @@ def test_extract_total_conflicting_amounts_same_currency_rejected():
     assert total.reason.startswith("ambiguous_total")
 
 
+def test_extract_total_dollar_and_euro_symbols_rejected_both_ways():
+    # Astra remaining-probe: "TOTAL $10.00 €10.00" -- same amount, two
+    # currency symbols. Must reject both the total (ambiguous) and the
+    # currency (conflicting), not silently pick the dollar figure.
+    total, currency = extract_total_and_currency([line("TOTAL $10.00 €10.00")])
+    assert not total.ok
+    assert total.reason.startswith("ambiguous_total")
+    assert not currency.ok
+    assert currency.reason.startswith("currency_conflict")
+
+
+def test_extract_total_unmarked_amounts_after_single_currency_rejected():
+    # Astra remaining-probe: "TOTAL USD 10.00 20.00" -- one currency code,
+    # two unmarked candidate amounts. Currency is unambiguous but the
+    # total must still be refused as ambiguous rather than picking either
+    # number.
+    total, currency = extract_total_and_currency([line("TOTAL USD 10.00 20.00")])
+    assert not total.ok
+    assert total.reason.startswith("ambiguous_total")
+    assert currency.ok
+    assert currency.value == "USD"
+
+
 def test_classify_flags_low_confidence_item_even_with_high_receipt_mean():
     from receipt_ocr.models import FieldExtraction, LineItem
 
